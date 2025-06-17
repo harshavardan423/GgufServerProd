@@ -104,22 +104,31 @@ class ModelFormats:
     )
 
 class PromptLibrary:
+    # Base mindset - 30 words max
+    BASE_MINDSET = """You are Adam, a helpful AI assistant. Be direct, honest, and practical. Focus on providing clear, useful responses while being friendly and conversational."""
+
     DEFAULT = PromptTemplate(
-        system_prompt="""You are a helpful, intelligent assistant focused on providing clear, informative, and natural responses. Engage in conversation naturally while providing accurate and relevant information. If you're unsure about something, acknowledge it honestly. Keep responses concise but complete. When providing examples, format them using code blocks like ```html```, ```js```, or ```python``` as appropriate for the content.""",
+        system_prompt=f"""{BASE_MINDSET}
+
+You provide clear, informative, and natural responses. Engage in conversation naturally while providing accurate and relevant information. If you're unsure about something, acknowledge it honestly. Keep responses concise but complete. When providing examples, format them using code blocks like ```html```, ```js```, or ```python``` as appropriate for the content.""",
         temperature=0.7,
         max_tokens=4096,
         stop_sequences=["User:", "\n\n"]
     )
 
     CODE = PromptTemplate(
-        system_prompt="""You are an expert programming assistant. Provide clear, well-documented code solutions with explanations. Focus on best practices and efficient implementations. When sharing code, use the appropriate language formatting such as ```js``` for JavaScript or ```python``` for Python code.""",
+        system_prompt=f"""{BASE_MINDSET}
+
+As a programming assistant, provide clear, well-documented code solutions with explanations. Focus on best practices and efficient implementations. When sharing code, use the appropriate language formatting such as ```js``` for JavaScript or ```python``` for Python code.""",
         temperature=0.2,
         max_tokens=4096,
         stop_sequences=["User:", "\n\n"]
     )
 
     CREATIVE = PromptTemplate(
-        system_prompt="""You are a creative assistant capable of generating engaging and imaginative content. Think outside the box while maintaining coherence and quality. When providing examples of creative work, format it using the appropriate language blocks like ```html``` or ```text```.""",
+        system_prompt=f"""{BASE_MINDSET}
+
+As a creative assistant, generate engaging and imaginative content. Think outside the box while maintaining coherence and quality. When providing examples of creative work, format it using the appropriate language blocks like ```html``` or ```text```.""",
         temperature=0.9,
         max_tokens=4096,
         stop_sequences=["User:", "\n\n"]
@@ -403,12 +412,8 @@ class EnhancedResponseGenerator:
 
     def prepare_chat_messages(self, template: PromptTemplate, user_input: str, response_type: str) -> List[Dict[str, str]]:
         """Prepare chat messages with proper formatting"""
-        system_content = template.system_prompt
-        if response_type == "code":
-            system_content = f"You are a coding assistant. {system_content}"
-        
         return [
-            {"role": "system", "content": system_content},
+            {"role": "system", "content": template.system_prompt},
             {"role": "user", "content": user_input}
         ]
 
@@ -474,7 +479,8 @@ class EnhancedResponseGenerator:
                         "temperature": generation_params["temperature"],
                         "max_tokens": generation_params["max_tokens"],
                         "model_path": os.path.basename(self.model_path) if self.model_path else None,
-                        "model_format": self.model_format.chat_format if self.model_format else None
+                        "model_format": self.model_format.chat_format if self.model_format else None,
+                        "persona": "Adam"
                     },
                     "status": "success"
                 })
@@ -558,7 +564,8 @@ def health_check():
         "status": "ok" if generator and generator.llm else "error",
         "model_loaded": generator.llm is not None if generator else False,
         "model_path": os.path.basename(generator.model_path) if generator and generator.model_path else None,
-        "model_format": generator.model_format.chat_format if generator and generator.model_format else None
+        "model_format": generator.model_format.chat_format if generator and generator.model_format else None,
+        "persona": "Adam"
     }
     
     status_code = 200 if model_info["model_loaded"] else 503
@@ -575,6 +582,8 @@ def status():
     
     return jsonify({
         "status": "ready",
+        "persona": "Adam",
+        "mindset": PromptLibrary.BASE_MINDSET,
         "model_info": {
             "path": generator.model_path,
             "format": generator.model_format.chat_format if generator.model_format else None,
@@ -591,5 +600,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5003))
     debug = os.environ.get("DEBUG", "false").lower() == "true"
     
-    logger.info(f"Starting server on port {port}")
+    logger.info(f"Starting Adam AI server on port {port}")
     app.run(host="0.0.0.0", port=port, debug=debug)
