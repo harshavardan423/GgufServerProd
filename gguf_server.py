@@ -14,6 +14,12 @@ from pathlib import Path
 import hashlib
 
 try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+try:
     from llama_cpp import Llama
     LLAMA_CPP_AVAILABLE = True
 except ImportError:
@@ -33,6 +39,11 @@ try:
     HF_HUB_AVAILABLE = True
 except ImportError:
     HF_HUB_AVAILABLE = False
+
+# Environment-specific settings
+RENDER_MEMORY_LIMIT = os.environ.get("RENDER_MEMORY_LIMIT", "1GB")
+MAX_PROMPT_LENGTH = int(os.environ.get("MAX_PROMPT_LENGTH", "6000"))
+MAX_CONTEXT_SIZE = int(os.environ.get("MAX_CONTEXT_SIZE", "8192"))
 
 # Configure logging
 logging.basicConfig(
@@ -112,7 +123,7 @@ class PromptLibrary:
 
 You provide clear, informative, and natural responses. Engage in conversation naturally while providing accurate and relevant information. If you're unsure about something, acknowledge it honestly. Keep responses concise but complete. When providing examples, format them using code blocks like ```html```, ```js```, or ```python``` as appropriate for the content.""",
         temperature=0.7,
-        max_tokens=4096,
+        max_tokens=2048,  # Reduced from 4096
         stop_sequences=["User:", "\n\n"]
     )
 
@@ -121,7 +132,7 @@ You provide clear, informative, and natural responses. Engage in conversation na
 
 As a programming assistant, provide clear, well-documented code solutions with explanations. Focus on best practices and efficient implementations. When sharing code, use the appropriate language formatting such as ```js``` for JavaScript or ```python``` for Python code.""",
         temperature=0.2,
-        max_tokens=4096,
+        max_tokens=2048,  # Reduced from 4096
         stop_sequences=["User:", "\n\n"]
     )
 
@@ -130,7 +141,7 @@ As a programming assistant, provide clear, well-documented code solutions with e
 
 As a creative assistant, generate engaging and imaginative content. Think outside the box while maintaining coherence and quality. When providing examples of creative work, format it using the appropriate language blocks like ```html``` or ```text```.""",
         temperature=0.9,
-        max_tokens=4096,
+        max_tokens=2048,  # Reduced from 4096
         stop_sequences=["User:", "\n\n"]
     )
 
@@ -286,17 +297,59 @@ class EnhancedResponseGenerator:
         self.model_format: Optional[ModelFormat] = None
         self.model_path: Optional[str] = None
         self.model_config: Dict[str, Any] = {
-            "n_ctx": 4096,
-            "n_threads": 4,
-            "verbose": False,  # Reduce verbosity for production
+            "n_ctx": MAX_CONTEXT_SIZE,  # Use environment variable
+            "n_threads": 2,  # Reduced from 4 to save memory
+            "verbose": False,
             "repeat_penalty": 1.2,
             "top_p": 0.95,
-            "top_k": 40
+            "top_k": 40,
+            "n_batch": 256,  # Add batch size control
+            "use_mlock": False,  # Disable memory locking to save RAM
+            "use_mmap": True   # Enable memory mapping for efficiency
         }
         self.device = "cuda" if torch.cuda.is_available() else "cpu" if TRANSFORMERS_AVAILABLE else None
         self.current_model_type = "gguf"
         self.downloader = ModelDownloader()
         self.initialize_model()
+
+    def check_memory_usage(self) -> dict:
+        """Check current memory usage"""
+        if not PSUTIL_AVAILABLE:
+            return {"available": False}
+        
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            return {
+                "available": True,
+                "rss_mb": memory_info.rss / 1024 / 1024,  # Resident memory
+                "vms_mb": memory_info.vms / 1024 / 1024,  # Virtual memory
+                "percent": process.memory_percent()
+            }
+        except Exception as e:
+            logger.warning(f"Could not get memory info: {e}")
+            return {"available": False, "error": str(e)}
+
+    def calculate_safe_max_tokens(self, input_text: str, max_context: int = None) -> int:
+        """Calculate safe max_tokens based on input length"""
+        if max_context is None:
+            max_context = self.model_config["n_ctx"]
+        
+        # Rough estimation: 1 token ≈ 4 characters
+        estimated_input_tokens = len(input_text) // 4
+        
+        # Reserve tokens for system prompt and formatting
+        system_overhead = 300  # Increased overhead for safety
+        
+        # Calculate available tokens for generation
+        available_tokens = max_context - estimated_input_tokens - system_overhead
+        
+        # Ensure we don't go below minimum or above reasonable maximum
+        safe_tokens = max(256, min(available_tokens, 1536))  # More conservative limits
+        
+        logger.info(f"Input chars: {len(input_text)}, Estimated tokens: {estimated_input_tokens}, Safe max_tokens: {safe_tokens}")
+        
+        return safe_tokens
 
     def detect_model_format(self, model_path: str) -> ModelFormat:
         """Detect model format from model path"""
@@ -373,7 +426,7 @@ class EnhancedResponseGenerator:
                 config.update({
                     "temperature": 0.7,
                     "repeat_penalty": 1.1,
-                    "n_ctx": 2048
+                    "n_ctx": min(2048, MAX_CONTEXT_SIZE)  # Smaller context for tiny models
                 })
             
             # Try GPU first, fallback to CPU
@@ -417,10 +470,14 @@ class EnhancedResponseGenerator:
             {"role": "user", "content": user_input}
         ]
 
-    def get_generation_params(self, template: PromptTemplate, response_type: str) -> Dict[str, Any]:
-        """Get generation parameters based on response type"""
+    def get_generation_params(self, template: PromptTemplate, response_type: str, input_text: str = "") -> Dict[str, Any]:
+        """Get generation parameters based on response type and input length"""
+        
+        # Calculate safe token limit
+        safe_max_tokens = self.calculate_safe_max_tokens(input_text)
+        
         params = {
-            "max_tokens": template.max_tokens,
+            "max_tokens": min(template.max_tokens, safe_max_tokens),  # Use smaller value
             "temperature": template.temperature,
             "top_p": self.model_config["top_p"],
             "repeat_penalty": self.model_config["repeat_penalty"],
@@ -432,6 +489,12 @@ class EnhancedResponseGenerator:
             params["temperature"] = 0.2
         elif response_type == "creative":
             params["temperature"] = 0.9
+
+        # Further reduce tokens if memory is high
+        memory_info = self.check_memory_usage()
+        if memory_info.get("available") and memory_info.get("percent", 0) > 80:
+            params["max_tokens"] = min(params["max_tokens"], 512)
+            logger.warning(f"High memory usage ({memory_info['percent']:.1f}%), reducing max_tokens to {params['max_tokens']}")
 
         return params
 
@@ -447,18 +510,35 @@ class EnhancedResponseGenerator:
             if self.llm is None:
                 raise ValueError("Model not initialized")
 
+            # Check memory before generation
+            memory_info = self.check_memory_usage()
+            if memory_info.get("available") and memory_info.get("percent", 0) > 85:
+                logger.warning(f"High memory usage: {memory_info}")
+
             logger.info(f"Generating response for type: {response_type}")
             template = self.get_prompt_template(response_type)
             messages = self.prepare_chat_messages(template, user_input, response_type)
-            generation_params = self.get_generation_params(template, response_type)
+            generation_params = self.get_generation_params(template, response_type, user_input)
 
             logger.debug(f"Generation parameters: {generation_params}")
 
-            # Generate response
-            output = self.llm.create_chat_completion(
-                messages=messages,
-                **generation_params
-            )
+            # Generate response with error handling
+            try:
+                output = self.llm.create_chat_completion(
+                    messages=messages,
+                    **generation_params
+                )
+            except Exception as gen_error:
+                if "context" in str(gen_error).lower() or "length" in str(gen_error).lower():
+                    # Try with even smaller tokens
+                    generation_params["max_tokens"] = min(generation_params["max_tokens"], 256)
+                    logger.warning(f"Context error, retrying with max_tokens={generation_params['max_tokens']}")
+                    output = self.llm.create_chat_completion(
+                        messages=messages,
+                        **generation_params
+                    )
+                else:
+                    raise gen_error
 
             if output and "choices" in output and output["choices"]:
                 conversation_response = output["choices"][0]["message"]["content"].strip()
@@ -480,7 +560,8 @@ class EnhancedResponseGenerator:
                         "max_tokens": generation_params["max_tokens"],
                         "model_path": os.path.basename(self.model_path) if self.model_path else None,
                         "model_format": self.model_format.chat_format if self.model_format else None,
-                        "persona": "Adam"
+                        "persona": "Adam",
+                        "input_length": len(user_input)
                     },
                     "status": "success"
                 })
@@ -491,10 +572,26 @@ class EnhancedResponseGenerator:
                     "status": "error"
                 })
 
+        except MemoryError:
+            logger.error("Out of memory during generation")
+            return json.dumps({
+                "conversation_response": "Request too large. Please reduce input size.",
+                "status": "error",
+                "error_type": "memory_limit"
+            })
         except Exception as e:
             logger.error(f"Error during generation: {str(e)}")
+            
+            # Check if it's a context length error
+            if "context" in str(e).lower() or "length" in str(e).lower():
+                return json.dumps({
+                    "conversation_response": "Input too long for current model context. Please reduce input size.",
+                    "status": "error",
+                    "error_type": "context_length"
+                })
+            
             return json.dumps({
-                "conversation_response": "An error occurred while processing your request. Please try again.",
+                "conversation_response": "An error occurred while processing your request. Please try again with a shorter input.",
                 "error": str(e),
                 "status": "error"
             })
@@ -512,7 +609,7 @@ except Exception as e:
     generator = None
 
 @app.route('/generate_response', methods=['POST'])
-@rate_limit(max_requests=60, window_seconds=60)
+@rate_limit(max_requests=30, window_seconds=60)  # Reduced from 60 to 30
 def get_response():
     """Generate response endpoint"""
     if generator is None:
@@ -538,6 +635,15 @@ def get_response():
             except Exception as e:
                 return jsonify({"error": "Invalid base64 encoding", "details": str(e)}), 400
 
+        # INPUT LENGTH VALIDATION
+        if len(user_input) > MAX_PROMPT_LENGTH:
+            return jsonify({
+                "error": f"Input too long. Maximum allowed: {MAX_PROMPT_LENGTH} characters",
+                "max_chars": MAX_PROMPT_LENGTH,
+                "current_chars": len(user_input),
+                "status": "error"
+            }), 400
+
         response_type = data.get('response_type', 'chat')
 
         if response_type not in [rt.value for rt in ResponseType]:
@@ -546,6 +652,16 @@ def get_response():
             }), 400
 
         logger.info(f"Processing request - Type: {response_type}, Input length: {len(user_input)}")
+        
+        # Check memory before processing
+        memory_info = generator.check_memory_usage()
+        if memory_info.get("available") and memory_info.get("percent", 0) > 90:
+            return jsonify({
+                "error": "Server memory usage too high. Please try again later.",
+                "status": "error",
+                "error_type": "memory_limit"
+            }), 503
+
         response = generator.generate_response(user_input, response_type)
         return response, 200, {'Content-Type': 'application/json'}
 
@@ -560,12 +676,17 @@ def get_response():
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
+    memory_info = generator.check_memory_usage() if generator else {"available": False}
+    
     model_info = {
         "status": "ok" if generator and generator.llm else "error",
         "model_loaded": generator.llm is not None if generator else False,
         "model_path": os.path.basename(generator.model_path) if generator and generator.model_path else None,
         "model_format": generator.model_format.chat_format if generator and generator.model_format else None,
-        "persona": "Adam"
+        "persona": "Adam",
+        "memory_info": memory_info,
+        "max_prompt_length": MAX_PROMPT_LENGTH,
+        "max_context_size": MAX_CONTEXT_SIZE
     }
     
     status_code = 200 if model_info["model_loaded"] else 503
@@ -580,6 +701,8 @@ def status():
             "message": "Generator not initialized"
         }), 500
     
+    memory_info = generator.check_memory_usage()
+    
     return jsonify({
         "status": "ready",
         "persona": "Adam",
@@ -587,13 +710,20 @@ def status():
         "model_info": {
             "path": generator.model_path,
             "format": generator.model_format.chat_format if generator.model_format else None,
-            "loaded": generator.llm is not None
+            "loaded": generator.llm is not None,
+            "context_size": generator.model_config["n_ctx"]
         },
         "server_info": {
             "llama_cpp_available": LLAMA_CPP_AVAILABLE,
             "transformers_available": TRANSFORMERS_AVAILABLE,
-            "hf_hub_available": HF_HUB_AVAILABLE
-        }
+            "hf_hub_available": HF_HUB_AVAILABLE,
+            "psutil_available": PSUTIL_AVAILABLE
+        },
+        "limits": {
+            "max_prompt_length": MAX_PROMPT_LENGTH,
+            "max_context_size": MAX_CONTEXT_SIZE
+        },
+        "memory_info": memory_info
     })
 
 if __name__ == "__main__":
@@ -601,4 +731,7 @@ if __name__ == "__main__":
     debug = os.environ.get("DEBUG", "false").lower() == "true"
     
     logger.info(f"Starting Adam AI server on port {port}")
+    logger.info(f"Max prompt length: {MAX_PROMPT_LENGTH}")
+    logger.info(f"Max context size: {MAX_CONTEXT_SIZE}")
+    
     app.run(host="0.0.0.0", port=port, debug=debug)
