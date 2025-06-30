@@ -70,6 +70,7 @@ class ResponseType(Enum):
     ANALYSIS = "analysis"
     CREATIVE = "creative"
     CODE = "code"
+    VISION = "vision"
 
 @dataclass
 class ModelFormat:
@@ -97,7 +98,14 @@ class ModelFormats:
     LLAVA = ModelFormat(
         chat_format="llava-1-5",
         start_sequence="USER:",
-        stop_sequences=["ASSISTANT:", "<|endoftext|>"],
+        stop_sequences=["ASSISTANT:", "<|endoftext|>", "\nUSER:", "\nHuman:", "\nUser:"],
+        system_template="SYSTEM: {}\n",
+        supports_vision=True
+    )
+    LLAVA_V16 = ModelFormat(
+        chat_format="llava-v1",
+        start_sequence="USER:",
+        stop_sequences=["ASSISTANT:", "<|endoftext|>", "\nUSER:", "\nHuman:", "\nUser:"],
         system_template="SYSTEM: {}\n",
         supports_vision=True
     )
@@ -139,7 +147,7 @@ class ModelFormats:
 
 class PromptLibrary:
     # Base mindset - 30 words max
-    BASE_MINDSET = """You are Adam, a helpful AI assistant. Be direct, honest, and practical. Focus on providing clear, useful responses while being friendly and conversational."""
+    BASE_MINDSET = """You are Adam, a helpful AI assistant with vision capabilities. Be direct, honest, and practical. Focus on providing clear, useful responses while being friendly and conversational."""
 
     DEFAULT = PromptTemplate(
         system_prompt=f"""{BASE_MINDSET}
@@ -153,7 +161,14 @@ You provide clear, informative, and natural responses. Engage in conversation na
     VISION = PromptTemplate(
         system_prompt=f"""{BASE_MINDSET}
 
-You are a vision-capable AI that can analyze images. When images are provided, describe what you see in detail and answer questions about the visual content. Be specific about objects, people, text, colors, and spatial relationships in the images.""",
+You are a vision-capable AI assistant that can analyze images in detail. When images are provided:
+1. Describe what you see comprehensively - objects, people, text, colors, composition, and spatial relationships
+2. Answer questions about the visual content with specificity and accuracy
+3. Identify text, logos, signs, and other readable elements
+4. Analyze artistic elements, emotions, and context when relevant
+5. Provide helpful insights about the image content
+
+Be thorough but concise. If asked about something not visible in the image, clearly state that.""",
         temperature=0.7,
         max_tokens=2048,
         stop_sequences=["User:", "\n\n"]
@@ -162,7 +177,7 @@ You are a vision-capable AI that can analyze images. When images are provided, d
     CODE = PromptTemplate(
         system_prompt=f"""{BASE_MINDSET}
 
-As a programming assistant, provide clear, well-documented code solutions with explanations. Focus on best practices and efficient implementations. When sharing code, use the appropriate language formatting such as ```js``` for JavaScript or ```python``` for Python code.""",
+As a programming assistant with vision capabilities, provide clear, well-documented code solutions with explanations. When images of code are provided, analyze them carefully and provide improvements or explanations. Focus on best practices and efficient implementations. When sharing code, use the appropriate language formatting such as ```js``` for JavaScript or ```python``` for Python code.""",
         temperature=0.2,
         max_tokens=2048,
         stop_sequences=["User:", "\n\n"]
@@ -171,25 +186,52 @@ As a programming assistant, provide clear, well-documented code solutions with e
     CREATIVE = PromptTemplate(
         system_prompt=f"""{BASE_MINDSET}
 
-As a creative assistant, generate engaging and imaginative content. Think outside the box while maintaining coherence and quality. When providing examples of creative work, format it using the appropriate language blocks like ```html``` or ```text```.""",
+As a creative assistant with vision capabilities, generate engaging and imaginative content. When images are provided, use them as inspiration for creative works. Think outside the box while maintaining coherence and quality. When providing examples of creative work, format it using the appropriate language blocks like ```html``` or ```text```.""",
         temperature=0.9,
         max_tokens=2048,
         stop_sequences=["User:", "\n\n"]
     )
 
 class ModelDownloader:
-    DEFAULT_MODEL_INFO = {
-        "repo_id": "TheBloke/Llama-2-7B-Chat-GGUF",
-        "filename": "llama-2-7b-chat.Q4_K_M.gguf",
-        "expected_size": 4368438272,
-        "checksum": None
+    # Vision-capable models prioritized for GPU setups
+    VISION_MODELS = {
+        "high_quality": {  # Best quality vision model
+            "repo_id": "cjpais/llava-v1.6-mistral-7b-gguf",
+            "filename": "llava-v1.6-mistral-7b.Q5_K_M.gguf",
+            "expected_size": 5600000000,  # ~5.6GB
+            "checksum": None,
+            "description": "LLaVA v1.6 with Mistral 7B - High Quality Q5"
+        },
+        "balanced": {  # Good balance of quality and speed
+            "repo_id": "cjpais/llava-v1.6-mistral-7b-gguf", 
+            "filename": "llava-v1.6-mistral-7b.Q4_K_M.gguf",
+            "expected_size": 4200000000,  # ~4.2GB
+            "checksum": None,
+            "description": "LLaVA v1.6 with Mistral 7B - Balanced Q4"
+        },
+        "fast": {  # Faster but lower quality
+            "repo_id": "mys/ggml_llava-v1.5-7b",
+            "filename": "ggml-model-q4_k.gguf",
+            "expected_size": 4000000000,  # ~4GB
+            "checksum": None,
+            "description": "LLaVA v1.5 - Fast Q4"
+        }
     }
     
-    VISION_MODEL_INFO = {
-        "repo_id": "mys/ggml_llava-v1.5-7b",
-        "filename": "ggml-model-q4_k.gguf",
-        "expected_size": 4368438272,
-        "checksum": None
+    # Fallback text-only models if vision fails
+    FALLBACK_MODELS = {
+        "high_memory": {  # 16GB+ VRAM
+            "repo_id": "TheBloke/Llama-2-13B-chat-GGUF",
+            "filename": "llama-2-13b-chat.Q4_K_M.gguf",
+            "expected_size": 7323000000,
+            "description": "Llama 2 13B Chat - Large Model"
+        },
+        "medium_memory": {  # 8-16GB VRAM  
+            "repo_id": "TheBloke/Llama-2-7B-Chat-GGUF",
+            "filename": "llama-2-7b-chat.Q5_K_M.gguf",
+            "expected_size": 4781000000,
+            "description": "Llama 2 7B Chat - High Quality"
+        }
     }
 
     def __init__(self):
@@ -198,8 +240,40 @@ class ModelDownloader:
         self.models_dir.mkdir(exist_ok=True)
         logger.info(f"Models directory: {self.models_dir}")
 
+    def detect_gpu_memory(self) -> str:
+        """Detect available GPU memory to choose best model"""
+        try:
+            import subprocess
+            result = subprocess.run(['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                vram_mb = int(result.stdout.strip())
+                vram_gb = vram_mb / 1024
+                logger.info(f"Detected GPU VRAM: {vram_gb:.1f}GB")
+                
+                if vram_gb >= 12:  # High-end GPU
+                    return "high_quality"
+                elif vram_gb >= 8:   # Mid-range GPU  
+                    return "balanced"
+                else:              # Lower-end GPU
+                    return "fast"
+            else:
+                logger.warning("Could not detect GPU memory, using balanced model")
+                return "balanced"
+        except Exception as e:
+            logger.warning(f"GPU memory detection failed: {e}, using balanced model")
+            return "balanced"
+
+    def get_optimal_vision_model(self) -> Dict:
+        """Get the best vision model for current hardware"""
+        gpu_category = self.detect_gpu_memory()
+        optimal_model = self.VISION_MODELS[gpu_category]
+        logger.info(f"Selected {gpu_category} vision model: {optimal_model['filename']}")
+        logger.info(f"Model description: {optimal_model['description']}")
+        return optimal_model
+
     def find_existing_gguf(self) -> Optional[str]:
-        """Find existing GGUF files in current directory and models subdirectory"""
+        """Find existing GGUF files with preference for vision models"""
         search_patterns = [
             str(self.current_dir / "*.gguf"),
             str(self.models_dir / "*.gguf")
@@ -209,18 +283,43 @@ class ModelDownloader:
             gguf_files = glob.glob(pattern)
             if gguf_files:
                 logger.info(f"Found existing GGUF files: {gguf_files}")
-                # Prefer vision models if available and vision is enabled
-                if ENABLE_VISION:
-                    vision_files = [f for f in gguf_files if 'llava' in f.lower() or 'vision' in f.lower()]
-                    if vision_files:
-                        selected_file = vision_files[0]
-                        logger.info(f"Selected vision model: {selected_file}")
-                        return selected_file
                 
-                # Return the largest file (likely better quality)
-                gguf_files.sort(key=lambda x: os.path.getsize(x), reverse=True)
+                # Strongly prefer vision models
+                vision_files = [f for f in gguf_files if any(keyword in f.lower() 
+                               for keyword in ['llava', 'vision', 'multimodal', 'clip'])]
+                
+                if vision_files:
+                    # Sort vision models by quality (Q5 > Q4 > Q3) and size
+                    def vision_model_score(filename):
+                        name = filename.lower()
+                        score = 0
+                        if 'q5' in name: score += 50
+                        elif 'q4' in name: score += 40  
+                        elif 'q3' in name: score += 30
+                        
+                        if 'v1.6' in name: score += 20
+                        elif 'v1.5' in name: score += 10
+                        
+                        if 'mistral' in name: score += 5
+                        
+                        return score
+                    
+                    vision_files.sort(key=vision_model_score, reverse=True)
+                    selected_file = vision_files[0]
+                    logger.info(f"Selected best vision model: {selected_file}")
+                    return selected_file
+                
+                # If no vision models, select best text model
+                def model_quality_score(filename):
+                    name = filename.lower()
+                    if 'q5' in name: return 5
+                    elif 'q4' in name: return 4
+                    elif 'q3' in name: return 3
+                    else: return 1
+                
+                gguf_files.sort(key=lambda x: (model_quality_score(x), os.path.getsize(x)), reverse=True)
                 selected_file = gguf_files[0]
-                logger.info(f"Selected GGUF file: {selected_file}")
+                logger.info(f"Selected best existing model: {selected_file}")
                 return selected_file
         
         logger.info("No existing GGUF files found")
@@ -236,10 +335,10 @@ class ModelDownloader:
             response.raise_for_status()
             
             total_size = int(response.headers.get('content-length', 0))
-            logger.info(f"Total file size: {total_size / (1024*1024):.2f} MB")
+            logger.info(f"Total file size: {total_size / (1024*1024*1024):.2f} GB")
             
             downloaded = 0
-            chunk_size = 8192
+            chunk_size = 8192 * 16  # Larger chunks for faster download
             
             with open(filepath, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=chunk_size):
@@ -247,9 +346,10 @@ class ModelDownloader:
                         f.write(chunk)
                         downloaded += len(chunk)
                         
-                        if downloaded % (100 * 1024 * 1024) == 0 or downloaded == total_size:
+                        # Progress every 500MB
+                        if downloaded % (500 * 1024 * 1024) == 0 or downloaded >= total_size:
                             progress = (downloaded / total_size * 100) if total_size > 0 else 0
-                            logger.info(f"Download progress: {progress:.1f}% ({downloaded / (1024*1024):.2f} MB)")
+                            logger.info(f"Download progress: {progress:.1f}% ({downloaded / (1024*1024*1024):.2f} GB)")
             
             logger.info(f"Download completed: {filepath}")
             return True
@@ -268,7 +368,8 @@ class ModelDownloader:
             logger.info(f"Model already exists: {model_path}")
             return str(model_path)
         
-        logger.info(f"Downloading {model_info['filename']}...")
+        logger.info(f"Downloading vision model: {model_info['filename']}...")
+        logger.info(f"Description: {model_info['description']}")
         
         # Try HuggingFace Hub first
         if HF_HUB_AVAILABLE:
@@ -296,23 +397,25 @@ class ModelDownloader:
         return None
 
     def get_model_path(self) -> Optional[str]:
-        """Get model path - either existing or newly downloaded"""
-        # First check for existing models
+        """Get model path - prioritize vision models"""
+        # First check for existing models (with vision preference)
         existing_model = self.find_existing_gguf()
         if existing_model:
             return existing_model
         
-        # Download appropriate model based on vision capability requirement
-        if ENABLE_VISION:
-            logger.info("Attempting to download vision-capable model...")
-            vision_model = self.download_model(self.VISION_MODEL_INFO)
-            if vision_model:
-                return vision_model
-            logger.warning("Vision model download failed, falling back to default model")
+        # Download optimal vision model for current hardware
+        logger.info("No existing model found, downloading optimal vision model...")
+        optimal_model_info = self.get_optimal_vision_model()
         
-        # Download default model
-        logger.info("Downloading default model...")
-        return self.download_model(self.DEFAULT_MODEL_INFO)
+        vision_model_path = self.download_model(optimal_model_info)
+        if vision_model_path:
+            return vision_model_path
+        
+        # Fallback to text-only model if vision download fails
+        logger.warning("Vision model download failed, falling back to text-only model")
+        gpu_memory = "medium_memory" if self.detect_gpu_memory() == "balanced" else "high_memory"
+        fallback_info = self.FALLBACK_MODELS[gpu_memory]
+        return self.download_model(fallback_info)
 
 def rate_limit(max_requests: int, window_seconds: int):
     def decorator(f):
@@ -370,14 +473,18 @@ class ImageProcessor:
                 image_bytes = base64.b64decode(base64_data)
                 image = Image.open(BytesIO(image_bytes))
                 
+                # Convert to RGB if necessary
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                
                 # Create temporary file
                 temp_file = tempfile.NamedTemporaryFile(
-                    suffix='.png', delete=False, prefix=f'img_{idx}_'
+                    suffix='.jpg', delete=False, prefix=f'img_{idx}_'
                 )
                 self.temp_files.append(temp_file.name)
                 
                 # Save image
-                image.save(temp_file.name, 'PNG')
+                image.save(temp_file.name, 'JPEG', quality=95)
                 image_paths.append(temp_file.name)
                 
                 logger.info(f"Processed image {idx}: {image.size} pixels -> {temp_file.name}")
@@ -395,12 +502,12 @@ class EnhancedResponseGenerator:
         self.model_path: Optional[str] = None
         self.model_config: Dict[str, Any] = {
             "n_ctx": MAX_CONTEXT_SIZE,
-            "n_threads": 2,
+            "n_threads": 4,  # Increased for better performance
             "verbose": False,
-            "repeat_penalty": 1.2,
+            "repeat_penalty": 1.1,  # Reduced for better coherence
             "top_p": 0.95,
             "top_k": 40,
-            "n_batch": 256,
+            "n_batch": 512,  # Increased for better GPU utilization
             "use_mlock": False,
             "use_mmap": True
         }
@@ -435,9 +542,9 @@ class EnhancedResponseGenerator:
             max_context = self.model_config["n_ctx"]
         
         estimated_input_tokens = len(input_text) // 4
-        system_overhead = 300
+        system_overhead = 400  # Increased for vision models
         available_tokens = max_context - estimated_input_tokens - system_overhead
-        safe_tokens = max(256, min(available_tokens, 1536))
+        safe_tokens = max(256, min(available_tokens, 2048))  # Increased max
         
         logger.info(f"Input chars: {len(input_text)}, Estimated tokens: {estimated_input_tokens}, Safe max_tokens: {safe_tokens}")
         
@@ -448,8 +555,17 @@ class EnhancedResponseGenerator:
         model_name = os.path.basename(model_path).lower()
         logger.info(f"Detecting format for model: {model_name}")
         
-        if "llava" in model_name or "vision" in model_name:
-            logger.info("Detected LLaVA/Vision model")
+        if "llava" in model_name:
+            if "v1.6" in model_name or "mistral" in model_name:
+                logger.info("Detected LLaVA v1.6/Mistral vision model")
+                self.supports_vision = True
+                return ModelFormats.LLAVA_V16
+            else:
+                logger.info("Detected LLaVA v1.5 vision model")
+                self.supports_vision = True
+                return ModelFormats.LLAVA
+        elif any(keyword in model_name for keyword in ["vision", "multimodal", "clip"]):
+            logger.info("Detected vision model")
             self.supports_vision = True
             return ModelFormats.LLAVA
         elif "codellama" in model_name:
@@ -468,7 +584,7 @@ class EnhancedResponseGenerator:
             logger.info("Detected Neural Chat model")
             return ModelFormats.NEURAL_CHAT
         else:
-            logger.info(f"Using default format for model: {model_name}")
+            logger.info(f"Using default Llama2 format for model: {model_name}")
             return ModelFormats.LLAMA2
 
     def initialize_model(self):
@@ -493,7 +609,7 @@ class EnhancedResponseGenerator:
             raise
 
     def load_model(self):
-        """Load the GGUF model"""
+        """Load the GGUF model with vision support"""
         try:
             if not self.model_path or not os.path.exists(self.model_path):
                 raise FileNotFoundError(f"Model file not found: {self.model_path}")
@@ -503,27 +619,29 @@ class EnhancedResponseGenerator:
             config = self.model_config.copy()
             config["chat_format"] = self.model_format.chat_format
             
-            # Adjust settings for vision models
+            # Enhanced settings for vision models
             if self.supports_vision:
                 config.update({
-                    "n_ctx": min(4096, MAX_CONTEXT_SIZE),  # Vision models often need more context
-                    "clip_model_path": None  # Let llama-cpp auto-detect clip model
+                    "n_ctx": min(4096, MAX_CONTEXT_SIZE),  # Vision models need more context
+                    "clip_model_path": None,  # Auto-detect CLIP model
+                    "logits_all": True,  # Required for some vision models
                 })
+                logger.info("Configured for vision model with CLIP support")
             
             # Try GPU first, fallback to CPU
             try:
                 logger.info("Attempting to load model with GPU acceleration...")
                 self.llm = Llama(
                     model_path=self.model_path,
-                    n_gpu_layers=-1,
+                    n_gpu_layers=-1,  # Use all GPU layers
                     **config
                 )
                 logger.info("Model loaded successfully with GPU acceleration")
             except Exception as gpu_error:
                 logger.warning(f"GPU loading failed: {str(gpu_error)}. Falling back to CPU.")
+                config["n_gpu_layers"] = 0
                 self.llm = Llama(
                     model_path=self.model_path,
-                    n_gpu_layers=0,
                     **config
                 )
                 logger.info("Model loaded successfully on CPU")
@@ -544,7 +662,8 @@ class EnhancedResponseGenerator:
             ResponseType.CHAT.value: PromptLibrary.DEFAULT,
             ResponseType.ANALYSIS.value: PromptLibrary.DEFAULT,
             ResponseType.CREATIVE.value: PromptLibrary.CREATIVE,
-            ResponseType.CODE.value: PromptLibrary.CODE
+            ResponseType.CODE.value: PromptLibrary.CODE,
+            ResponseType.VISION.value: PromptLibrary.VISION
         }
         return type_mapping.get(response_type, PromptLibrary.DEFAULT)
 
@@ -566,6 +685,7 @@ class EnhancedResponseGenerator:
                 })
             
             messages.append({"role": "user", "content": user_content})
+            logger.info(f"Prepared vision message with {len(image_paths)} images")
         else:
             # Text-only message
             if image_paths:
@@ -589,23 +709,26 @@ class EnhancedResponseGenerator:
             "stop": self.model_format.stop_sequences if self.model_format else template.stop_sequences
         }
 
+        # Adjust parameters by response type
         if response_type == "code":
-            params["temperature"] = 0.2
+            params["temperature"] = 0.1  # More deterministic for code
         elif response_type == "creative":
-            params["temperature"] = 0.9
+            params["temperature"] = 0.9  # More creative
+        elif response_type == "vision":
+            params["temperature"] = 0.7  # Balanced for vision tasks
 
         memory_info = self.check_memory_usage()
         if memory_info.get("available") and memory_info.get("percent", 0) > 80:
-            params["max_tokens"] = min(params["max_tokens"], 512)
+            params["max_tokens"] = min(params["max_tokens"], 1024)
             logger.warning(f"High memory usage ({memory_info['percent']:.1f}%), reducing max_tokens to {params['max_tokens']}")
 
         return params
 
     def generate_response(self, user_input: str, response_type: str = "chat", images_data: List[Dict] = None) -> str:
-        """Generate response using the loaded model with optional image support"""
+        """Generate response using the loaded model with vision support"""
         if not user_input and not images_data:
             return json.dumps({
-                "conversation_response": "Please provide some input.",
+                "conversation_response": "Please provide some input or images.",
                 "status": "error"
             })
 
@@ -616,9 +739,14 @@ class EnhancedResponseGenerator:
             # Process images if provided
             image_paths = []
             if images_data:
-                logger.info(f"Processing {len(images_data)} images")
+                logger.info(f"Processing {len(images_data)} images for vision analysis")
                 image_paths = self.image_processor.process_base64_images(images_data)
                 logger.info(f"Successfully processed {len(image_paths)} images")
+                
+                # If images provided but no text, set default vision prompt
+                if not user_input:
+                    user_input = "Please analyze these images and describe what you see in detail."
+                    response_type = "vision"
 
             memory_info = self.check_memory_usage()
             if memory_info.get("available") and memory_info.get("percent", 0) > 85:
@@ -638,7 +766,7 @@ class EnhancedResponseGenerator:
                 )
             except Exception as gen_error:
                 if "context" in str(gen_error).lower() or "length" in str(gen_error).lower():
-                    generation_params["max_tokens"] = min(generation_params["max_tokens"], 256)
+                    generation_params["max_tokens"] = min(generation_params["max_tokens"], 512)
                     logger.warning(f"Context error, retrying with max_tokens={generation_params['max_tokens']}")
                     output = self.llm.create_chat_completion(
                         messages=messages,
@@ -650,6 +778,7 @@ class EnhancedResponseGenerator:
             if output and "choices" in output and output["choices"]:
                 conversation_response = output["choices"][0]["message"]["content"].strip()
                 
+                # Clean up response
                 if self.model_format:
                     for stop_seq in self.model_format.stop_sequences:
                         conversation_response = conversation_response.replace(stop_seq, "")
@@ -669,7 +798,8 @@ class EnhancedResponseGenerator:
                         "supports_vision": self.supports_vision,
                         "images_processed": len(image_paths),
                         "persona": "Adam",
-                        "input_length": len(user_input)
+                        "input_length": len(user_input),
+                        "vision_capable": self.supports_vision
                     },
                     "status": "success"
                 })
@@ -683,7 +813,7 @@ class EnhancedResponseGenerator:
         except MemoryError:
             logger.error("Out of memory during generation")
             return json.dumps({
-                "conversation_response": "Request too large. Please reduce input size.",
+                "conversation_response": "Request too large. Please reduce input size or image count.",
                 "status": "error",
                 "error_type": "memory_limit"
             })
@@ -721,7 +851,7 @@ except Exception as e:
 @app.route('/generate_response', methods=['POST'])
 @rate_limit(max_requests=30, window_seconds=60)
 def get_response():
-    """Generate response endpoint with image support"""
+    """Generate response endpoint with enhanced image support"""
     if generator is None:
         return jsonify({
             "error": "Model not initialized. Please check server logs.",
@@ -766,7 +896,7 @@ def get_response():
                 "status": "error"
             }), 400
 
-        response_type = data.get('response_type', 'chat')
+        response_type = data.get('response_type', 'vision' if images_data else 'chat')
 
         if response_type not in [rt.value for rt in ResponseType]:
             return jsonify({
@@ -814,7 +944,8 @@ def health_check():
         "persona": "Adam",
         "memory_info": memory_info,
         "max_prompt_length": MAX_PROMPT_LENGTH,
-        "max_context_size": MAX_CONTEXT_SIZE
+        "max_context_size": MAX_CONTEXT_SIZE,
+        "image_processing": PIL_AVAILABLE
     }
     
     status_code = 200 if model_info["model_loaded"] else 503
@@ -833,7 +964,7 @@ def status():
     
     return jsonify({
         "status": "ready",
-        "persona": "Adam",
+        "persona": "Adam - Vision-Capable AI Assistant",
         "mindset": PromptLibrary.BASE_MINDSET,
         "model_info": {
             "path": generator.model_path,
@@ -841,6 +972,13 @@ def status():
             "loaded": generator.llm is not None,
             "supports_vision": generator.supports_vision,
             "context_size": generator.model_config["n_ctx"]
+        },
+        "capabilities": {
+            "text_generation": True,
+            "code_generation": True,
+            "creative_writing": True,
+            "image_analysis": generator.supports_vision,
+            "multi_image_support": generator.supports_vision and PIL_AVAILABLE
         },
         "server_info": {
             "llama_cpp_available": LLAMA_CPP_AVAILABLE,
@@ -857,13 +995,30 @@ def status():
         "memory_info": memory_info
     })
 
+@app.route('/test_vision', methods=['POST'])
+def test_vision():
+    """Test endpoint specifically for vision capabilities"""
+    if not generator or not generator.supports_vision:
+        return jsonify({
+            "error": "Vision capabilities not available",
+            "supports_vision": False
+        }), 400
+    
+    return jsonify({
+        "message": "Vision capabilities are active",
+        "supports_vision": True,
+        "model_format": generator.model_format.chat_format,
+        "instructions": "Send images via 'images' array in POST request to /generate_response"
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5003))
     debug = os.environ.get("DEBUG", "false").lower() == "true"
     
-    logger.info(f"Starting Adam AI server on port {port}")
+    logger.info(f"Starting Adam AI server with vision capabilities on port {port}")
     logger.info(f"Max prompt length: {MAX_PROMPT_LENGTH}")
     logger.info(f"Max context size: {MAX_CONTEXT_SIZE}")
     logger.info(f"Vision support enabled: {ENABLE_VISION}")
+    logger.info(f"PIL available for image processing: {PIL_AVAILABLE}")
     
     app.run(host="0.0.0.0", port=port, debug=debug)
